@@ -199,6 +199,7 @@ describe("App layout", () => {
     toggleThemeSpy.mockReset();
     attachSpy.mockReset();
     runStatusHandlers.clear();
+    window.history.replaceState(null, "", "/");
     localStorage.removeItem("nanobot-webui.sidebar.completed-runs.v1");
     vi.mocked(fetchBootstrap).mockReset().mockResolvedValue({
       token: "tok",
@@ -628,6 +629,44 @@ describe("App layout", () => {
     expect(attachSpy).toHaveBeenCalledWith("chat-a");
   });
 
+  it("restores the active chat from the URL hash after a page reload", async () => {
+    mockSessions = [
+      {
+        key: "websocket:chat-a",
+        channel: "websocket",
+        chatId: "chat-a",
+        createdAt: "2026-04-16T10:00:00Z",
+        updatedAt: "2026-04-16T10:00:00Z",
+        preview: "Active after reload",
+      },
+      {
+        key: "websocket:chat-b",
+        channel: "websocket",
+        chatId: "chat-b",
+        createdAt: "2026-04-16T11:00:00Z",
+        updatedAt: "2026-04-16T11:00:00Z",
+        preview: "Other chat",
+      },
+    ];
+    window.history.replaceState(
+      null,
+      "",
+      `/#/chat/${encodeURIComponent("websocket:chat-a")}`,
+    );
+
+    render(<App />);
+
+    await waitFor(() => expect(connectSpy).toHaveBeenCalled());
+    await waitFor(() => expect(document.title).toBe("Active after reload · nanobot"));
+    const sidebar = screen.getByRole("navigation", { name: "Sidebar navigation" });
+    expect(
+      within(sidebar).getByRole("button", { name: /^Active after reload$/ }),
+    ).toBeInTheDocument();
+    expect(window.location.hash).toBe(
+      `#/chat/${encodeURIComponent("websocket:chat-a")}`,
+    );
+  });
+
   it("opens the settings view from the sidebar footer", async () => {
     mockSessions = [
       {
@@ -827,9 +866,6 @@ describe("App layout", () => {
                 },
                 dream: {
                   schedule: "every 2h",
-                  max_batch_size: 20,
-                  max_iterations: 15,
-                  annotate_line_ages: true,
                 },
                 unified_session: false,
               },
@@ -891,9 +927,9 @@ describe("App layout", () => {
     expect(screen.queryByText("AI")).not.toBeInTheDocument();
     expect(screen.getByText("Current configuration")).toBeInTheDocument();
     expect(screen.queryByText("Presets")).not.toBeInTheDocument();
-    fireEvent.pointerDown(screen.getAllByRole("button", { name: /openai\/gpt-4o/ })[0]);
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Current configuration" }));
     fireEvent.click(screen.getByRole("menuitem", { name: "Add configuration" }));
-    const modelDialog = screen.getByRole("dialog", { name: "New model configuration" });
+    const modelDialog = await screen.findByRole("dialog", { name: "New model configuration" });
     expect(within(modelDialog).getByText("Save a provider and model as a one-click option.")).toBeInTheDocument();
     fireEvent.change(within(modelDialog).getByPlaceholderText("Fast writing"), {
       target: { value: "Fast writing" },
@@ -989,6 +1025,51 @@ describe("App layout", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: /Asia\/Shanghai/ }));
     expect(screen.getByRole("button", { name: "Asia/Shanghai" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+  });
+
+  it("restores the settings section from the URL hash after a page reload", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        if (String(input) === "/api/settings") {
+          return jsonResponse(baseSettingsPayload());
+        }
+        return { ok: false, status: 404, json: async () => ({}) } as Response;
+      }),
+    );
+    window.history.replaceState(null, "", "/#/settings?section=models");
+
+    render(<App />);
+
+    await waitFor(() => expect(connectSpy).toHaveBeenCalled());
+    expect(await screen.findByRole("heading", { name: "Models" })).toBeInTheDocument();
+    expect(window.location.hash).toBe("#/settings?section=models");
+  });
+
+  it("updates the URL hash when switching settings sections", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        if (String(input) === "/api/settings") {
+          return jsonResponse(baseSettingsPayload());
+        }
+        return { ok: false, status: 404, json: async () => ({}) } as Response;
+      }),
+    );
+
+    render(<App />);
+
+    await waitFor(() => expect(connectSpy).toHaveBeenCalled());
+    const sidebar = screen.getByRole("navigation", { name: "Sidebar navigation" });
+    fireEvent.click(within(sidebar).getByRole("button", { name: "Settings" }));
+    expect(await screen.findByRole("heading", { name: "Overview" })).toBeInTheDocument();
+    expect(window.location.hash).toBe("#/settings");
+
+    const settingsNav = screen.getByRole("navigation", { name: "Settings sections" });
+    fireEvent.click(within(settingsNav).getByRole("button", { name: "Models" }));
+
+    expect(await screen.findByRole("heading", { name: "Models" })).toBeInTheDocument();
+    expect(window.location.hash).toBe("#/settings?section=models");
   });
 
   it("opens Apps from the main sidebar without replacing the sidebar", async () => {
@@ -1134,9 +1215,6 @@ describe("App layout", () => {
                 },
                 dream: {
                   schedule: "every 2h",
-                  max_batch_size: 20,
-                  max_iterations: 15,
-                  annotate_line_ages: true,
                 },
                 unified_session: false,
               },
