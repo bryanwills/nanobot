@@ -128,6 +128,7 @@ class TurnContext:
     pending_summary: str | None = None
 
     ephemeral: bool = False
+    run_extra_hooks_for_ephemeral: bool = False
     tools: ToolRegistry | None = None
 
     turn_wall_started_at: float = field(default_factory=time.time)
@@ -693,6 +694,7 @@ class AgentLoop:
         session_key: str | None = None,
         pending_queue: asyncio.Queue | None = None,
         ephemeral: bool = False,
+        run_extra_hooks_for_ephemeral: bool = False,
         tools: ToolRegistry | None = None,
     ) -> tuple[str | None, list[str], list[dict], str, bool]:
         """Run the agent iteration loop.
@@ -720,7 +722,7 @@ class AgentLoop:
             on_iteration=lambda iteration: setattr(self, "_current_iteration", iteration),
         )
         hook: AgentHook = loop_hook
-        if not ephemeral and self._extra_hooks:
+        if self._extra_hooks and (not ephemeral or run_extra_hooks_for_ephemeral):
             hook = CompositeHook([loop_hook] + self._extra_hooks)
 
         async def _checkpoint(payload: dict[str, Any]) -> None:
@@ -1239,6 +1241,7 @@ class AgentLoop:
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         pending_queue: asyncio.Queue | None = None,
         ephemeral: bool = False,
+        run_extra_hooks_for_ephemeral: bool = False,
         tools: ToolRegistry | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
@@ -1271,6 +1274,7 @@ class AgentLoop:
             on_stream_end=on_stream_end,
             pending_queue=pending_queue,
             ephemeral=ephemeral,
+            run_extra_hooks_for_ephemeral=run_extra_hooks_for_ephemeral,
             tools=tools,
         )
 
@@ -1497,6 +1501,7 @@ class AgentLoop:
             session_key=ctx.session_key,
             pending_queue=ctx.pending_queue,
             ephemeral=ctx.ephemeral,
+            run_extra_hooks_for_ephemeral=ctx.run_extra_hooks_for_ephemeral,
             tools=ctx.tools,
         )
         final_content, tools_used, all_msgs, stop_reason, had_injections = result
@@ -1812,6 +1817,7 @@ class AgentLoop:
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
         ephemeral: bool = False,
+        _run_extra_hooks_for_ephemeral: bool = False,
         tools: ToolRegistry | None = None,
         persist_user_message: bool = True,
     ) -> OutboundMessage | None:
@@ -1835,6 +1841,8 @@ class AgentLoop:
                     "on_stream_end": on_stream_end,
                     "ephemeral": ephemeral,
                 }
+                if _run_extra_hooks_for_ephemeral:
+                    kwargs["run_extra_hooks_for_ephemeral"] = True
                 if tools is not None:
                     kwargs["tools"] = tools
                 return await self._process_message(
