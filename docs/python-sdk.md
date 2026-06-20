@@ -112,6 +112,11 @@ async for event in run.stream_events():
 result = await run.wait()
 ```
 
+Always either consume the stream, call `await run.wait()` / `await run.text()`,
+or close it with `await run.cancel()` / `await run.aclose()`. Exiting
+`stream_events()` or `bot.stream()` early cancels the underlying run so a
+half-consumed stream cannot leave a background task stuck behind backpressure.
+
 ### Import an existing transcript
 
 Use `bot.sessions.ingest()` when you already have a transcript and want it to
@@ -231,6 +236,12 @@ async for event in bot.stream("Generate a long answer"):
 | `stream_events()` | Single-consumer async iterator of `StreamEvent` objects. |
 | `await wait()` | Wait for the run to finish and return `RunResult`. |
 | `await text()` | Wait for the run to finish and return `RunResult.content`. |
+| `await cancel()` | Cancel the run and release stream resources. |
+| `await aclose()` | Close the stream; equivalent cleanup primitive for `async with` / manual lifecycle code. |
+
+Normal SDK runs with different session keys may overlap. Runs that use per-run
+`model` or `model_preset` overrides are exclusive while the override is active,
+because the current `AgentLoop` provider/model state is mutable.
 
 ### `StreamEvent`
 

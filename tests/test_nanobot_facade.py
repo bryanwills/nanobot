@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -139,7 +140,11 @@ async def test_run_returns_result(tmp_path):
 
     assert isinstance(result, RunResult)
     assert result.content == "Hello back!"
-    bot._loop.process_direct.assert_awaited_once_with("hi", session_key="sdk:default")
+    bot._loop.process_direct.assert_awaited_once_with(
+        "hi",
+        session_key="sdk:default",
+        hooks=ANY,
+    )
 
 
 @pytest.mark.asyncio
@@ -234,7 +239,11 @@ async def test_run_custom_session_key(tmp_path):
     bot._loop.process_direct = AsyncMock(return_value=mock_response)
 
     await bot.run("hi", session_key="user-alice")
-    bot._loop.process_direct.assert_awaited_once_with("hi", session_key="user-alice")
+    bot._loop.process_direct.assert_awaited_once_with(
+        "hi",
+        session_key="user-alice",
+        hooks=ANY,
+    )
 
 
 def test_import_from_top_level():
@@ -294,21 +303,19 @@ async def test_run_populates_tools_used_across_iterations(tmp_path):
     config_path = _write_config(tmp_path)
     bot = Nanobot.from_config(config_path, workspace=tmp_path)
 
-    async def fake_process_direct(message, *, session_key):
-        # Whatever hooks the SDK installed are now on the loop.
-        extras = bot._loop._extra_hooks
+    async def fake_process_direct(message, *, session_key, hooks):
         messages = [{"role": "user", "content": message}]
         ctx1 = AgentHookContext(iteration=0, messages=messages)
         ctx1.tool_calls = [
             ToolCallRequest(id="c1", name="read_file", arguments={}),
             ToolCallRequest(id="c2", name="grep", arguments={}),
         ]
-        for h in extras:
+        for h in hooks:
             await h.after_iteration(ctx1)
         messages.append({"role": "assistant", "content": "ok"})
         ctx2 = AgentHookContext(iteration=1, messages=messages)
         ctx2.tool_calls = [ToolCallRequest(id="c3", name="web_fetch", arguments={})]
-        for h in extras:
+        for h in hooks:
             await h.after_iteration(ctx2)
         return OutboundMessage(channel="cli", chat_id="direct", content="final")
 
@@ -327,14 +334,13 @@ async def test_run_populates_final_messages(tmp_path):
     config_path = _write_config(tmp_path)
     bot = Nanobot.from_config(config_path, workspace=tmp_path)
 
-    async def fake_process_direct(message, *, session_key):
-        extras = bot._loop._extra_hooks
+    async def fake_process_direct(message, *, session_key, hooks):
         messages = [
             {"role": "user", "content": message},
             {"role": "assistant", "content": "hi there"},
         ]
         ctx = AgentHookContext(iteration=0, messages=messages)
-        for h in extras:
+        for h in hooks:
             await h.after_iteration(ctx)
         return OutboundMessage(channel="cli", chat_id="direct", content="hi there")
 
@@ -372,7 +378,7 @@ async def test_run_populates_observability_fields(tmp_path):
     config_path = _write_config(tmp_path)
     bot = Nanobot.from_config(config_path, workspace=tmp_path)
 
-    async def fake_process_direct(message, *, session_key):
+    async def fake_process_direct(message, *, session_key, hooks):
         ctx = AgentRunHookContext(
             messages=[
                 {"role": "user", "content": message},
@@ -385,7 +391,7 @@ async def test_run_populates_observability_fields(tmp_path):
             error=None,
             tool_events=[{"tool": "read_file", "status": "ok"}],
         )
-        for h in bot._loop._extra_hooks:
+        for h in hooks:
             await h.after_run(ctx)
         return OutboundMessage(
             channel="cli",
@@ -461,7 +467,36 @@ async def test_run_forwards_non_default_runtime_options(tmp_path):
         media=["/tmp/image.png"],
         ephemeral=True,
         _run_extra_hooks_for_ephemeral=True,
+        hooks=ANY,
     )
+
+
+@pytest.mark.asyncio
+async def test_run_allows_parallel_sessions_without_model_override(tmp_path):
+    from nanobot.bus.events import OutboundMessage
+
+    config_path = _write_config(tmp_path)
+    bot = Nanobot.from_config(config_path, workspace=tmp_path)
+    entered: list[str] = []
+    both_entered = asyncio.Event()
+
+    async def fake_process_direct(message, *, session_key, hooks):
+        entered.append(session_key)
+        if len(entered) == 2:
+            both_entered.set()
+        await asyncio.wait_for(both_entered.wait(), timeout=1)
+        return OutboundMessage(channel="cli", chat_id="direct", content=message)
+
+    bot._loop.process_direct = fake_process_direct
+
+    left, right = await asyncio.gather(
+        bot.run("left", session_key="sdk:left"),
+        bot.run("right", session_key="sdk:right"),
+    )
+
+    assert left.content == "left"
+    assert right.content == "right"
+    assert set(entered) == {"sdk:left", "sdk:right"}
 
 
 @pytest.mark.asyncio
@@ -483,7 +518,7 @@ async def test_run_model_override_is_per_run_and_restores_default(tmp_path):
     )
     bot._model_override_snapshot = MagicMock(return_value=override)
 
-    async def fake_process_direct(message, *, session_key):
+    async def fake_process_direct(message, *, session_key, hooks):
         assert bot._loop.provider is override_provider
         assert bot._loop.runner.provider is override_provider
         assert bot._loop.model == "openai/gpt-4.1-mini"
@@ -522,7 +557,7 @@ async def test_run_model_preset_override_is_per_run(tmp_path):
     )
     bot._loop._build_model_preset_snapshot = MagicMock(return_value=override)
 
-    async def fake_process_direct(message, *, session_key):
+    async def fake_process_direct(message, *, session_key, hooks):
         assert bot._loop.provider is override_provider
         assert bot._loop.model == "openai/gpt-4.1-mini"
         return OutboundMessage(channel="cli", chat_id="direct", content="ok")
@@ -560,11 +595,10 @@ async def test_run_user_hooks_still_fire_alongside_capture(tmp_path):
         async def after_iteration(self, context: AgentHookContext) -> None:
             seen_iterations.append(context.iteration)
 
-    async def fake_process_direct(message, *, session_key):
-        extras = bot._loop._extra_hooks
-        assert len(extras) == 2, f"expected capture + user hook, got {len(extras)}"
+    async def fake_process_direct(message, *, session_key, hooks):
+        assert len(hooks) == 2, f"expected capture + user hook, got {len(hooks)}"
         ctx = AgentHookContext(iteration=7, messages=[])
-        for h in extras:
+        for h in hooks:
             await h.after_iteration(ctx)
         return OutboundMessage(channel="cli", chat_id="direct", content="ok")
 
@@ -585,9 +619,9 @@ async def test_run_restores_extra_hooks_even_on_populated_iterations(tmp_path):
     sentinel_hook = AgentHook()
     bot._loop._extra_hooks = [sentinel_hook]
 
-    async def fake_process_direct(message, *, session_key):
+    async def fake_process_direct(message, *, session_key, hooks):
         ctx = AgentHookContext(iteration=0, messages=[])
-        for h in bot._loop._extra_hooks:
+        for h in [*bot._loop._extra_hooks, *hooks]:
             await h.after_iteration(ctx)
         return OutboundMessage(channel="cli", chat_id="direct", content="done")
 
@@ -603,7 +637,7 @@ async def test_stream_yields_text_events_in_order(tmp_path):
     config_path = _write_config(tmp_path)
     bot = Nanobot.from_config(config_path, workspace=tmp_path)
 
-    async def fake_process_direct(message, *, session_key, on_stream, on_stream_end):
+    async def fake_process_direct(message, *, session_key, on_stream, on_stream_end, hooks):
         assert message == "hi"
         assert session_key == "sdk:default"
         await on_stream("Hel")
@@ -638,7 +672,7 @@ async def test_run_streamed_wait_returns_full_result_without_consuming_events(tm
     config_path = _write_config(tmp_path)
     bot = Nanobot.from_config(config_path, workspace=tmp_path)
 
-    async def fake_process_direct(message, *, session_key, on_stream, on_stream_end):
+    async def fake_process_direct(message, *, session_key, on_stream, on_stream_end, hooks):
         await on_stream("done")
         await on_stream_end(resuming=False)
         ctx = AgentRunHookContext(
@@ -651,7 +685,7 @@ async def test_run_streamed_wait_returns_full_result_without_consuming_events(tm
             usage={"total_tokens": 9},
             stop_reason="completed",
         )
-        for hook in bot._loop._extra_hooks:
+        for hook in hooks:
             await hook.after_run(ctx)
         return OutboundMessage(
             channel="cli",
@@ -671,6 +705,29 @@ async def test_run_streamed_wait_returns_full_result_without_consuming_events(tm
     assert result.usage == {"total_tokens": 9}
     assert result.stop_reason == "completed"
     assert result.metadata == {"latency_ms": 5}
+
+
+@pytest.mark.asyncio
+async def test_run_streamed_cancel_releases_full_queue_without_consuming(tmp_path):
+    from nanobot.bus.events import OutboundMessage
+
+    config_path = _write_config(tmp_path)
+    bot = Nanobot.from_config(config_path, workspace=tmp_path)
+
+    async def fake_process_direct(message, *, session_key, on_stream, on_stream_end, hooks):
+        for i in range(400):
+            await on_stream(str(i))
+        await on_stream_end(resuming=False)
+        return OutboundMessage(channel="cli", chat_id="direct", content="done")
+
+    bot._loop.process_direct = fake_process_direct
+
+    run = await bot.run_streamed("many")
+    await asyncio.sleep(0.05)
+    assert not run.done
+
+    await asyncio.wait_for(run.cancel(), timeout=1)
+    assert run.done
 
 
 @pytest.mark.asyncio
@@ -720,6 +777,7 @@ async def test_run_streamed_forwards_runtime_options(tmp_path):
     assert kwargs["ephemeral"] is True
     assert callable(kwargs["on_stream"])
     assert callable(kwargs["on_stream_end"])
+    assert kwargs["hooks"]
 
 
 @pytest.mark.asyncio
@@ -739,7 +797,7 @@ async def test_run_streamed_model_override_reports_model_and_restores(tmp_path):
     )
     bot._model_override_snapshot = MagicMock(return_value=override)
 
-    async def fake_process_direct(message, *, session_key, on_stream, on_stream_end):
+    async def fake_process_direct(message, *, session_key, on_stream, on_stream_end, hooks):
         assert bot._loop.provider is override_provider
         assert bot._loop.model == "openai/gpt-4.1-mini"
         await on_stream("ok")
@@ -781,20 +839,20 @@ async def test_run_streamed_emits_tool_events(tmp_path):
     config_path = _write_config(tmp_path)
     bot = Nanobot.from_config(config_path, workspace=tmp_path)
 
-    async def fake_process_direct(message, *, session_key, on_stream, on_stream_end):
+    async def fake_process_direct(message, *, session_key, on_stream, on_stream_end, hooks):
         calls = [
             ToolCallRequest(id="call_ok", name="read_file", arguments={"path": "README.md"}),
             ToolCallRequest(id="call_bad", name="exec", arguments={"cmd": "false"}),
         ]
         ctx = AgentHookContext(iteration=2, messages=[{"role": "user", "content": message}])
         ctx.tool_calls = calls
-        for hook in bot._loop._extra_hooks:
+        for hook in hooks:
             await hook.before_execute_tools(ctx)
         ctx.tool_events = [
             {"name": "read_file", "status": "ok", "detail": "README.md"},
             {"name": "exec", "status": "error", "detail": "exit 1"},
         ]
-        for hook in bot._loop._extra_hooks:
+        for hook in hooks:
             await hook.after_iteration(ctx)
         return OutboundMessage(channel="cli", chat_id="direct", content="done")
 
@@ -827,8 +885,8 @@ async def test_run_streamed_emits_reasoning_events(tmp_path):
     config_path = _write_config(tmp_path)
     bot = Nanobot.from_config(config_path, workspace=tmp_path)
 
-    async def fake_process_direct(message, *, session_key, on_stream, on_stream_end):
-        for hook in bot._loop._extra_hooks:
+    async def fake_process_direct(message, *, session_key, on_stream, on_stream_end, hooks):
+        for hook in hooks:
             await hook.emit_reasoning("thinking")
             await hook.emit_reasoning_end()
         return OutboundMessage(channel="cli", chat_id="direct", content="done")
@@ -844,6 +902,31 @@ async def test_run_streamed_emits_reasoning_events(tmp_path):
         "run.completed",
     ]
     assert events[1].delta == "thinking"
+
+
+@pytest.mark.asyncio
+async def test_stream_generator_break_cancels_underlying_run(tmp_path):
+    from nanobot.bus.events import OutboundMessage
+
+    config_path = _write_config(tmp_path)
+    bot = Nanobot.from_config(config_path, workspace=tmp_path)
+    cancelled = asyncio.Event()
+
+    async def fake_process_direct(message, *, session_key, on_stream, on_stream_end, hooks):
+        try:
+            await on_stream("first")
+            await asyncio.sleep(10)
+        finally:
+            cancelled.set()
+        return OutboundMessage(channel="cli", chat_id="direct", content="done")
+
+    bot._loop.process_direct = fake_process_direct
+
+    async for event in bot.stream("stop early"):
+        if event.type == STREAM_EVENT_TEXT_DELTA:
+            break
+
+    await asyncio.wait_for(cancelled.wait(), timeout=1)
 
 
 @pytest.mark.asyncio

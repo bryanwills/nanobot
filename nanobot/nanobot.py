@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Iterable, Mapping
+from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -87,6 +88,58 @@ class StreamEvent:
 _STREAM_SENTINEL = object()
 
 
+class _SDKRuntimeGate:
+    """Allow normal SDK runs to overlap while model overrides stay exclusive."""
+
+    def __init__(self) -> None:
+        self._condition = asyncio.Condition()
+        self._readers = 0
+        self._writer_active = False
+        self._writers_waiting = 0
+
+    def slot(self, *, exclusive: bool) -> _SDKRuntimeGateSlot:
+        return _SDKRuntimeGateSlot(self, exclusive=exclusive)
+
+    async def _acquire(self, *, exclusive: bool) -> None:
+        async with self._condition:
+            if exclusive:
+                self._writers_waiting += 1
+                try:
+                    await self._condition.wait_for(
+                        lambda: not self._writer_active and self._readers == 0
+                    )
+                    self._writer_active = True
+                finally:
+                    self._writers_waiting -= 1
+                    self._condition.notify_all()
+                return
+
+            await self._condition.wait_for(
+                lambda: not self._writer_active and self._writers_waiting == 0
+            )
+            self._readers += 1
+
+    async def _release(self, *, exclusive: bool) -> None:
+        async with self._condition:
+            if exclusive:
+                self._writer_active = False
+            else:
+                self._readers = max(0, self._readers - 1)
+            self._condition.notify_all()
+
+
+class _SDKRuntimeGateSlot:
+    def __init__(self, gate: _SDKRuntimeGate, *, exclusive: bool) -> None:
+        self._gate = gate
+        self._exclusive = exclusive
+
+    async def __aenter__(self) -> None:
+        await self._gate._acquire(exclusive=self._exclusive)
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self._gate._release(exclusive=self._exclusive)
+
+
 class RunStream:
     """A running SDK turn with Cursor/OpenAI-style event streaming."""
 
@@ -100,11 +153,18 @@ class RunStream:
         self._events_started = False
         self._events_done = False
         self._stream_active = False
+        self._closed = False
+
+    @property
+    def done(self) -> bool:
+        """Whether the underlying run task has finished."""
+        return self._task.done()
 
     async def stream_events(self) -> AsyncIterator[StreamEvent]:
         """Yield streaming events for this run.
 
-        The event stream is single-consumer: call this method only once.
+        The event stream is single-consumer: call this method only once. Closing
+        the iterator before completion cancels the underlying run.
         """
         if self._events_started:
             raise RuntimeError("RunStream.stream_events() can only be consumed once")
@@ -119,6 +179,8 @@ class RunStream:
                 yield item
         finally:
             self._stream_active = False
+            if not self._events_done:
+                await self.aclose()
 
     async def wait(self) -> RunResult:
         """Wait for the run to finish and return its final result."""
@@ -132,12 +194,42 @@ class RunStream:
         """Wait for the run to finish and return the final text."""
         return (await self.wait()).content
 
+    async def cancel(self) -> None:
+        """Cancel the running turn and release stream resources."""
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        """Close the stream, cancelling the run if it is still active."""
+        if self._closed:
+            return
+        self._closed = True
+        if not self._task.done():
+            self._task.cancel()
+        self._finish_events()
+        try:
+            await self._task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            # Closing is cleanup; wait() remains the API that surfaces run errors.
+            pass
+
     async def _drain_events(self) -> None:
         while not self._events_done:
             item = await self._queue.get()
             if item is _STREAM_SENTINEL:
                 self._events_done = True
                 break
+
+    def _finish_events(self) -> None:
+        self._events_done = True
+        while True:
+            with suppress(asyncio.QueueEmpty):
+                self._queue.get_nowait()
+                continue
+            break
+        with suppress(asyncio.QueueFull):
+            self._queue.put_nowait(_STREAM_SENTINEL)
 
 
 @dataclass(slots=True)
@@ -224,8 +316,11 @@ class _SDKStreamEmitter:
     def __init__(self, queue: asyncio.Queue[StreamEvent | object]) -> None:
         self._queue = queue
         self._text_parts: list[str] = []
+        self._closed = False
 
     async def emit(self, event: StreamEvent) -> None:
+        if self._closed:
+            return
         await self._queue.put(event)
 
     async def text_delta(self, delta: str, *, iteration: int | None = None) -> None:
@@ -256,8 +351,15 @@ class _SDKStreamEmitter:
             resuming=resuming,
         ))
 
-    async def close(self) -> None:
-        await self._queue.put(_STREAM_SENTINEL)
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._queue.full():
+            with suppress(asyncio.QueueEmpty):
+                self._queue.get_nowait()
+        with suppress(asyncio.QueueFull):
+            self._queue.put_nowait(_STREAM_SENTINEL)
 
 
 class _SDKStreamingHook(AgentHook):
@@ -475,7 +577,7 @@ class Nanobot:
     def __init__(self, loop: AgentLoop, *, config: Config | None = None) -> None:
         self._loop = loop
         self._config = config
-        self._sdk_run_lock = asyncio.Lock()
+        self._sdk_runtime_gate = _SDKRuntimeGate()
         self.sessions = SessionClient(loop)
         self.memory = MemoryClient(loop)
         self.runtime = RuntimeClient(loop)
@@ -644,10 +746,9 @@ class Nanobot:
             model_preset: Override the model preset for this run only.
         """
         capture = SDKCaptureHook()
-        prev = self._loop._extra_hooks
-        base_hooks = list(hooks) if hooks is not None else list(prev or [])
+        per_run_hooks = [capture, *(hooks or [])]
         override = self._model_override_snapshot(model=model, model_preset=model_preset)
-        async with self._sdk_run_lock:
+        async with self._sdk_runtime_gate.slot(exclusive=override is not None):
             restore = self._current_runtime_snapshot() if override is not None else None
             restore_signature = self._loop._provider_signature
             if override is not None:
@@ -656,7 +757,6 @@ class Nanobot:
                     publish_update=False,
                     model_preset=model_preset,
                 )
-            self._loop._extra_hooks = [capture, *base_hooks]
             kwargs = self._process_direct_kwargs(
                 session_key=session_key,
                 channel=channel,
@@ -669,9 +769,9 @@ class Nanobot:
                 response = await self._loop.process_direct(
                     message,
                     **kwargs,
+                    hooks=per_run_hooks,
                 )
             finally:
-                self._loop._extra_hooks = prev
                 if restore is not None:
                     self._restore_runtime_snapshot(
                         restore,
@@ -699,6 +799,7 @@ class Nanobot:
         emitter = _SDKStreamEmitter(queue)
         stream_hook = _SDKStreamingHook(emitter)
         capture = SDKCaptureHook()
+        per_run_hooks = [capture, stream_hook, *(hooks or [])]
         override = self._model_override_snapshot(model=model, model_preset=model_preset)
 
         async def _on_stream(delta: str) -> None:
@@ -708,9 +809,7 @@ class Nanobot:
             await emitter.text_completed(resuming=resuming)
 
         async def _run() -> RunResult:
-            async with self._sdk_run_lock:
-                prev = self._loop._extra_hooks
-                base_hooks = list(hooks) if hooks is not None else list(prev or [])
+            async with self._sdk_runtime_gate.slot(exclusive=override is not None):
                 restore = self._current_runtime_snapshot() if override is not None else None
                 restore_signature = self._loop._provider_signature
                 if override is not None:
@@ -719,7 +818,6 @@ class Nanobot:
                         publish_update=False,
                         model_preset=model_preset,
                     )
-                self._loop._extra_hooks = [capture, stream_hook, *base_hooks]
                 kwargs = self._process_direct_kwargs(
                     session_key=session_key,
                     channel=channel,
@@ -744,7 +842,11 @@ class Nanobot:
                     },
                 ))
                 try:
-                    response = await self._loop.process_direct(message, **kwargs)
+                    response = await self._loop.process_direct(
+                        message,
+                        **kwargs,
+                        hooks=per_run_hooks,
+                    )
                     await emitter.text_completed(resuming=False, force=False)
                     result = _result_from_response(response, capture)
                     await emitter.emit(StreamEvent(
@@ -763,13 +865,12 @@ class Nanobot:
                     ))
                     raise
                 finally:
-                    self._loop._extra_hooks = prev
                     if restore is not None:
                         self._restore_runtime_snapshot(
                             restore,
                             provider_signature=restore_signature,
                         )
-                    await emitter.close()
+                    emitter.close()
 
         task = asyncio.create_task(_run())
         return RunStream(task, queue)
@@ -801,9 +902,13 @@ class Nanobot:
             model=model,
             model_preset=model_preset,
         )
-        async for event in run.stream_events():
-            yield event
-        await run.wait()
+        try:
+            async for event in run.stream_events():
+                yield event
+            await run.wait()
+        finally:
+            if not run.done:
+                await run.aclose()
 
     async def aclose(self) -> None:
         """Release resources held by this instance (MCP connections, etc.)."""
