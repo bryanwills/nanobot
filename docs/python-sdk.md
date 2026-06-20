@@ -33,15 +33,10 @@ environments, install the package with:
 python -m pip install nanobot-ai
 ```
 
-`Nanobot.from_config()` reuses your normal `~/.nanobot/config.json`. Provider,
-model, tools, and workspace behavior match the CLI unless you override them.
-
-The SDK uses the same two default paths explained in [Concepts](concepts.md):
-
-| Path | Meaning |
-|------|---------|
-| `~/.nanobot/config.json` | Instance configuration: providers, model defaults, channels, tools, gateway, API, and runtime options. |
-| `~/.nanobot/workspace/` | Agent workspace: memory, sessions, heartbeat tasks, skills, and generated artifacts. |
+`Nanobot.from_config()` reuses your normal `~/.nanobot/config.json` and
+`~/.nanobot/workspace/`. Provider, model, tools, memory, and session behavior
+match the CLI unless you override them. For the difference between config and
+workspace, see [Concepts: Config vs Workspace](concepts.md#config-vs-workspace).
 
 Before writing SDK code, run the same first-run checks from the main
 [Install and Quick Start](quick-start.md):
@@ -200,21 +195,12 @@ result = await bot.run("Think deeply about this bug", model_preset="reasoning")
 
 `model` and `model_preset` are mutually exclusive.
 
-For first setup, prefer named presets in `config.json`. The provider config
-stores credentials and endpoint details; the model preset names the
-provider/model pair. This matches the guidance in [Providers and Models](providers.md):
-
-| Field | Where it lives | Meaning |
-|-------|----------------|---------|
-| `provider` | `modelPresets.<name>.provider` | Which nanobot provider adapter sends the request. |
-| `model` | `modelPresets.<name>.model` | Model ID expected by that provider or gateway. |
-| `apiKey` | `providers.<provider>.apiKey` | Credential for that provider. Use `${ENV_VAR}` for secrets. |
-| `apiBase` | `providers.<provider>.apiBase` | HTTP base URL for custom, local, proxy, regional, or subscription endpoints. |
-
-Mixing an API key from one provider with a model ID from another is the most
-common first-run failure. If a run fails before the SDK does anything
-interesting, confirm the same provider and model work with
-`nanobot agent -m "Hello!"` first.
+For first setup, prefer named presets in `config.json`. Mixing an API key from
+one provider with a model ID from another is the most common first-run failure.
+For the exact difference between `provider`, `model`, `apiKey`, and `apiBase`,
+see [Providers: Provider, Model, API Key, and Base URL](providers.md#provider-model-api-key-and-base-url).
+If a run fails before the SDK does anything interesting, confirm the same
+provider and model work with `nanobot agent -m "Hello!"` first.
 
 ### Isolate conversations with `session_key`
 
