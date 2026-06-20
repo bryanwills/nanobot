@@ -122,6 +122,64 @@ async for event in bot.stream("Write a migration plan"):
 Streaming returns structured events, so you can also observe tool calls,
 reasoning chunks, completion, and failures.
 
+## Complete Starter Script
+
+Save this as `sdk_demo.py` after `nanobot agent -m "Hello!"` works:
+
+```python
+import asyncio
+import sys
+
+from nanobot import (
+    STREAM_EVENT_RUN_COMPLETED,
+    STREAM_EVENT_RUN_FAILED,
+    STREAM_EVENT_TEXT_DELTA,
+    STREAM_EVENT_TOOL_STARTED,
+    Nanobot,
+)
+
+
+async def main() -> None:
+    prompt = " ".join(sys.argv[1:]) or "Explain what nanobot is in one paragraph."
+    session_key = "sdk:demo"
+
+    async with Nanobot.from_config() as bot:
+        print(f"model: {bot.runtime.model}")
+        print(f"workspace: {bot.runtime.workspace}")
+        print()
+
+        final_result = None
+        async for event in bot.stream(prompt, session_key=session_key):
+            if event.type == STREAM_EVENT_TEXT_DELTA:
+                print(event.delta, end="", flush=True)
+            elif event.type == STREAM_EVENT_TOOL_STARTED:
+                print(f"\n[tool] {event.name}", flush=True)
+            elif event.type == STREAM_EVENT_RUN_COMPLETED:
+                final_result = event.result
+            elif event.type == STREAM_EVENT_RUN_FAILED:
+                raise RuntimeError(event.error or "nanobot run failed")
+
+        print()
+        if final_result is not None:
+            print(f"\nstop_reason: {final_result.stop_reason}")
+            print(f"tools_used: {final_result.tools_used}")
+            print(f"usage: {final_result.usage}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+Run it:
+
+```bash
+python sdk_demo.py "List the top-level files in the current workspace."
+```
+
+This script shows the usual production shape: create one `Nanobot`, choose a
+stable `session_key`, stream events, keep the final `RunResult`, and let
+`async with` close runtime resources.
+
 ## Core Concepts
 
 | Concept | Meaning |
@@ -142,6 +200,22 @@ For most users, the mental model is:
 3. Call `run` or `stream`.
 4. Read `RunResult` or stream events.
 5. Use session/memory/runtime helpers only when you need more control.
+
+## SDK Or OpenAI-Compatible API?
+
+nanobot has two programming surfaces:
+
+| Use | Choose | Why |
+|-----|--------|-----|
+| Python code running in the same process as nanobot | Python SDK | Direct access to `RunResult`, sessions, memory, runtime helpers, hooks, and stream events. |
+| Existing OpenAI-compatible clients, another language, or a separate process | [OpenAI-Compatible API](openai-api.md) | HTTP `/v1/chat/completions` compatibility with familiar client libraries. |
+
+The Python SDK is best when you are writing evals, notebooks, benchmark
+runners, product backends, local scripts, or integrations that should control
+nanobot directly.
+
+The OpenAI-compatible API is best when you already have an HTTP client, want
+process isolation, or need to call nanobot from a non-Python service.
 
 ## Common Patterns
 
@@ -217,6 +291,43 @@ Use stable keys in product code:
 session_key = f"user:{user_id}"
 result = await bot.run(user_message, session_key=session_key)
 ```
+
+Avoid using the default `"sdk:default"` for multiple users or unrelated
+workflows. It is convenient for local experiments, but stable product code
+should choose explicit keys such as `user:<id>`, `project:<id>`, or
+`eval:<case-id>`.
+
+### Handle failures
+
+For a normal non-streamed run, catch exceptions around `bot.run(...)` and inspect
+`RunResult.error` when the runtime returns a structured failure:
+
+```python
+try:
+    result = await bot.run("Review this repo", session_key="project:demo")
+except Exception as exc:
+    print(f"SDK call failed before a result was returned: {exc}")
+else:
+    if result.error:
+        print(f"Agent run failed: {result.error}")
+    else:
+        print(result.content)
+```
+
+For streamed runs, either consume the stream to completion or close it:
+
+```python
+run = await bot.run_streamed("Write a long answer", session_key="task:123")
+try:
+    async for event in run.stream_events():
+        ...
+finally:
+    if not run.done:
+        await run.aclose()
+```
+
+Use `await run.cancel()` when the user presses a stop button or leaves the page
+before the stream finishes.
 
 ### Stream long-running output
 
