@@ -79,6 +79,11 @@ Use `async with` when possible so tool connections and background cleanup are
 closed before the event loop exits. If you manage the instance manually, call
 `await bot.aclose()` in a `finally` block.
 
+The SDK is async-first because agent runs may stream tokens, execute tools, and
+wait on external services. In a normal Python script, wrap your async function
+with `asyncio.run(...)` as shown above. In a notebook or another async app, call
+`await bot.run(...)` directly from your existing event loop.
+
 ### Inspect What Happened
 
 `bot.run(...)` returns a `RunResult`, not just a string:
@@ -174,6 +179,22 @@ Run it:
 
 ```bash
 python sdk_demo.py "List the top-level files in the current workspace."
+```
+
+You should see the configured model, workspace path, streamed assistant text,
+and final run metadata. The exact answer depends on your config and workspace,
+but a file-listing prompt may look like this:
+
+```text
+model: openai/gpt-4.1-mini
+workspace: /Users/alice/.nanobot/workspace
+
+[tool] list_dir
+Here are the top-level files I found...
+
+stop_reason: completed
+tools_used: ['list_dir']
+usage: {'prompt_tokens': ..., 'completion_tokens': ..., 'total_tokens': ...}
 ```
 
 This script shows the usual production shape: create one `Nanobot`, choose a
