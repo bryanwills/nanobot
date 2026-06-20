@@ -1,18 +1,52 @@
 # Python SDK
 
-Use nanobot as a library — no CLI, no gateway, just Python. The SDK exposes
-the same agent runtime used by the CLI, plus stable helpers for sessions,
-memory, and compaction.
+Use nanobot as a Python library. The SDK gives you the same agent runtime used
+by the CLI, but from code: model routing, tools, workspace access, conversation
+history, memory, streaming events, and runtime helpers.
 
-Before debugging SDK code, prove the same config works from the CLI:
+If you have used the OpenAI SDK before, the most important difference is this:
+
+- OpenAI SDK calls a model.
+- nanobot SDK runs an agent around a model.
+
+That means one SDK call can read files, call tools, keep session history, use
+memory, stream progress, and return structured runtime information.
+
+```text
+your Python code
+  -> Nanobot SDK
+    -> agent runtime
+      -> configured model provider
+      -> tools
+      -> workspace
+      -> session history
+      -> memory
+```
+
+## Before You Start
+
+Install and configure nanobot first. If you have not done that yet, follow the
+[Quick Start](quick-start.md) and complete the setup wizard. For SDK-only Python
+environments, install the package with:
+
+```bash
+python -m pip install nanobot-ai
+```
+
+`Nanobot.from_config()` reuses your normal `~/.nanobot/config.json`. Provider,
+model, tools, and workspace behavior match the CLI unless you override them.
+
+If you are setting up nanobot for the first time, verify the config from the CLI:
 
 ```bash
 nanobot agent -m "Hello!"
 ```
 
-`Nanobot.from_config()` reuses your normal `~/.nanobot/config.json`, so provider, model, tools, and workspace behavior match the CLI unless you override them.
+Once that works, the SDK should see the same runtime.
 
-## Quick Start
+## 5-Minute Quick Start
+
+### Ask One Question
 
 ```python
 import asyncio
@@ -29,19 +63,85 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-Use `async with` when possible so MCP connections and background cleanup work are closed before the event loop exits. If you manage the instance manually, call `await bot.aclose()` in a `finally` block.
+Use `async with` when possible so tool connections and background cleanup are
+closed before the event loop exits. If you manage the instance manually, call
+`await bot.aclose()` in a `finally` block.
+
+### Inspect What Happened
+
+`bot.run(...)` returns a `RunResult`, not just a string:
+
+```python
+result = await bot.run("Review this repository")
+
+print(result.content)     # final answer
+print(result.tools_used)  # tools the agent used
+print(result.usage)       # token usage when available
+print(result.stop_reason) # why the run stopped
+```
+
+### Continue A Conversation
+
+Use a `session_key` when you want history to carry across turns. Different
+session keys are isolated from each other:
+
+```python
+await bot.run("My name is Alice.", session_key="user:alice")
+result = await bot.run("What is my name?", session_key="user:alice")
+
+print(result.content)
+```
+
+This is the SDK equivalent of giving each user, task, eval case, or workflow
+its own conversation thread.
+
+### Stream A Long Answer
+
+For live output, use `bot.stream(...)`:
+
+```python
+from nanobot import STREAM_EVENT_TEXT_DELTA
+
+async for event in bot.stream("Write a migration plan"):
+    if event.type == STREAM_EVENT_TEXT_DELTA:
+        print(event.delta, end="", flush=True)
+```
+
+Streaming returns structured events, so you can also observe tool calls,
+reasoning chunks, completion, and failures.
+
+## Core Concepts
+
+| Concept | Meaning |
+|---------|---------|
+| `Nanobot` | The SDK object that owns one configured agent runtime. |
+| Run | One call to `bot.run(...)`, `bot.run_streamed(...)`, or `bot.stream(...)`. |
+| `session_key` | The conversation history key. Reuse it to continue a thread; change it to isolate a thread. |
+| Workspace | The local directory where file tools and shell tools operate. |
+| Tools | Capabilities the agent may call, such as file access, shell, web, or custom tools from your config. |
+| Memory | Long-term memory files managed by nanobot. |
+| Stream event | A typed event such as `text.delta`, `tool.started`, or `run.completed`. |
+| Model override | A temporary model or model preset used for one SDK instance or one run. |
+
+For most users, the mental model is:
+
+1. Create a `Nanobot` from config.
+2. Pick a `session_key`.
+3. Call `run` or `stream`.
+4. Read `RunResult` or stream events.
+5. Use session/memory/runtime helpers only when you need more control.
 
 ## Common Patterns
 
 ### Use a specific config or workspace
 
+Set the workspace when your agent should work inside a specific project:
+
 ```python
 from nanobot import Nanobot
 
-bot = Nanobot.from_config(
-    config_path="~/.nanobot/config.json",
-    workspace="/my/project",
-)
+async with Nanobot.from_config(workspace="/my/project") as bot:
+    result = await bot.run("Explain the project structure")
 ```
 
 ### Choose a default or per-run model
@@ -75,6 +175,13 @@ Different session keys keep independent conversation history:
 ```python
 await bot.run("hi", session_key="user-alice")
 await bot.run("hi", session_key="task-42")
+```
+
+Use stable keys in product code:
+
+```python
+session_key = f"user:{user_id}"
+result = await bot.run(user_message, session_key=session_key)
 ```
 
 ### Stream long-running output
@@ -119,9 +226,11 @@ half-consumed stream cannot leave a background task stuck behind backpressure.
 
 ### Import an existing transcript
 
+This is useful for evals, benchmark runners, migrations, and tests.
+
 Use `bot.sessions.ingest()` when you already have a transcript and want it to
 become nanobot session history. Ingesting a transcript does not call the model,
-execute tools, trigger Dream, or compact automatically.
+execute tools, update memory, or compact automatically.
 
 ```python
 await bot.sessions.ingest(
@@ -154,7 +263,8 @@ print(result.content)
 
 ### Attach hooks for observability
 
-Hooks let you inspect tool calls, streaming, and iteration state without modifying nanobot internals:
+Hooks are an advanced escape hatch. Use them when you want custom logging,
+metrics, tracing, or output post-processing without modifying nanobot internals:
 
 ```python
 from nanobot.agent import AgentHook, AgentHookContext
@@ -171,7 +281,7 @@ result = await bot.run("Review this change", hooks=[AuditHook()])
 
 ## API Reference
 
-### `Nanobot.from_config(config_path=None, *, workspace=None)`
+### `Nanobot.from_config(config_path=None, *, workspace=None, model=None, model_preset=None)`
 
 Create a `Nanobot` instance from a config file.
 
@@ -279,7 +389,7 @@ Use the exported constants instead of hard-coded strings when possible:
 
 ### `await bot.aclose()`
 
-Release resources held by the SDK instance, including MCP connections. The async context manager calls this automatically:
+Release resources held by the SDK instance, including tool connections. The async context manager calls this automatically:
 
 ```python
 async with Nanobot.from_config() as bot:
@@ -449,12 +559,12 @@ class TimingHook(AgentHook):
 
 
 async def main() -> None:
-    bot = Nanobot.from_config(workspace="/my/project")
-    result = await bot.run(
-        "Explain the main function",
-        session_key="sdk:demo",
-        hooks=[TimingHook()],
-    )
+    async with Nanobot.from_config(workspace="/my/project") as bot:
+        result = await bot.run(
+            "Explain the main function",
+            session_key="sdk:demo",
+            hooks=[TimingHook()],
+        )
     print(result.content)
 
 
