@@ -36,13 +36,30 @@ python -m pip install nanobot-ai
 `Nanobot.from_config()` reuses your normal `~/.nanobot/config.json`. Provider,
 model, tools, and workspace behavior match the CLI unless you override them.
 
-If you are setting up nanobot for the first time, verify the config from the CLI:
+The SDK uses the same two default paths explained in [Concepts](concepts.md):
+
+| Path | Meaning |
+|------|---------|
+| `~/.nanobot/config.json` | Instance configuration: providers, model defaults, channels, tools, gateway, API, and runtime options. |
+| `~/.nanobot/workspace/` | Agent workspace: memory, sessions, heartbeat tasks, skills, and generated artifacts. |
+
+Before writing SDK code, run the same first-run checks from the main
+[Install and Quick Start](quick-start.md):
+
+```bash
+nanobot status
+```
+
+`nanobot status` should show the config path, workspace path, active model or
+preset, and provider summary. Then send one real message:
 
 ```bash
 nanobot agent -m "Hello!"
 ```
 
-Once that works, the SDK should see the same runtime.
+A normal assistant reply means install, config, provider/model selection, and
+workspace access are all usable. Once that works, the SDK should see the same
+runtime.
 
 ## 5-Minute Quick Start
 
@@ -144,6 +161,21 @@ async with Nanobot.from_config(workspace="/my/project") as bot:
     result = await bot.run("Explain the project structure")
 ```
 
+Use a custom config when you run multiple nanobot instances or test an isolated
+setup:
+
+```python
+async with Nanobot.from_config(
+    config_path="./bot-a/config.json",
+    workspace="./bot-a/workspace",
+) as bot:
+    result = await bot.run("Hello from bot A")
+```
+
+The config controls what nanobot may use. The workspace is where nanobot keeps
+state for that instance. See [multiple-instances.md](multiple-instances.md) for
+multi-instance CLI and gateway examples.
+
 ### Choose a default or per-run model
 
 Set the SDK instance default model when you create the bot:
@@ -167,6 +199,22 @@ result = await bot.run("Think deeply about this bug", model_preset="reasoning")
 ```
 
 `model` and `model_preset` are mutually exclusive.
+
+For first setup, prefer named presets in `config.json`. The provider config
+stores credentials and endpoint details; the model preset names the
+provider/model pair. This matches the guidance in [Providers and Models](providers.md):
+
+| Field | Where it lives | Meaning |
+|-------|----------------|---------|
+| `provider` | `modelPresets.<name>.provider` | Which nanobot provider adapter sends the request. |
+| `model` | `modelPresets.<name>.model` | Model ID expected by that provider or gateway. |
+| `apiKey` | `providers.<provider>.apiKey` | Credential for that provider. Use `${ENV_VAR}` for secrets. |
+| `apiBase` | `providers.<provider>.apiBase` | HTTP base URL for custom, local, proxy, regional, or subscription endpoints. |
+
+Mixing an API key from one provider with a model ID from another is the most
+common first-run failure. If a run fails before the SDK does anything
+interesting, confirm the same provider and model work with
+`nanobot agent -m "Hello!"` first.
 
 ### Isolate conversations with `session_key`
 
@@ -278,6 +326,22 @@ class AuditHook(AgentHook):
 
 result = await bot.run("Review this change", hooks=[AuditHook()])
 ```
+
+## Where To Go Next
+
+The SDK page is the programming entry point. The fuller conceptual and
+configuration docs remain the source of truth for the runtime around it:
+
+| Need | Read |
+|------|------|
+| First working install and config | [Install and Quick Start](quick-start.md) |
+| Mental model for config, workspace, sessions, tools, and memory | [Concepts](concepts.md) |
+| Provider/model/API key/base URL matching | [Providers and Models](providers.md) |
+| Pasteable provider recipes | [Provider Cookbook](provider-cookbook.md) |
+| Complete configuration reference | [Configuration](configuration.md) |
+| Long-term memory design | [Memory](memory.md) |
+| HTTP API instead of Python SDK | [OpenAI-Compatible API](openai-api.md) |
+| Debugging install, config, provider, or runtime failures | [Troubleshooting](troubleshooting.md) |
 
 ## API Reference
 
